@@ -84,14 +84,33 @@ export interface BotState {
   // Smart Money signals
   smartMoneySignals: SmartMoneySignal[];
 
-  // Paper Trading (Dry Run)
+  // Paper Trading (Dry Run) - Enhanced for Issue #12
   paper?: {
     balance: number;
     initialBalance: number;
     pnl: number;
     trades: number;
     totalVolume: number;
+    positions: PaperPosition[];  // 🔴 FIX #12: Track open positions
   };
+}
+
+// 🔴 FIX #12: Paper position tracking for dry-run mode
+export interface PaperPosition {
+  id: string;
+  timestamp: string;
+  strategy: 'smartMoney' | 'arbitrage' | 'dipArb' | 'direct';
+  market: string;
+  tokenId: string;
+  side: 'YES' | 'NO' | 'UP' | 'DOWN';
+  size: number;
+  entryPrice: number;
+  costBasis: number;
+  status: 'open' | 'closed';
+  closePrice?: number;
+  closeTimestamp?: string;
+  realizedPnL?: number;
+  closeReason?: 'manual' | 'resolution' | 'strategy';
 }
 
 export interface DipArbSignal {

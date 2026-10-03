@@ -109,7 +109,7 @@ let CONFIG = {
   },
 
   arbitrage: {
-    enabled: process.env.ARBITRAGE_ENABLED === 'true',
+    enabled: process.env.ARBITRAGE_ENABLED !== 'false',  // 🔴 FIX #13: Default enabled
     // 🔴 FIXED: Higher profit threshold for gas fees
     profitThreshold: 0.01,  // Up from 0.001 to 1%
     minTradeSize: 20,  // Up from 5 to reduce gas impact
@@ -124,7 +124,7 @@ let CONFIG = {
   },
 
   dipArb: {
-    enabled: process.env.DIPARB_ENABLED === 'true',
+    enabled: process.env.DIPARB_ENABLED !== 'false',  // 🔴 FIX #13: Default enabled
     coins: ['BTC', 'ETH', 'SOL'] as const,
     shares: 10,
     sumTarget: 0.92,
@@ -487,6 +487,115 @@ function simulateTrade(profit: number, strategy: string, description: string) {
 }
 
 // ============================================================================
+// 🔴 FIX #12: Paper Position Tracking for Dry-Run Mode
+// ============================================================================
+
+type PaperPosition = import('./src/dashboard/types.js').PaperPosition;
+
+function openPaperPosition(
+  strategy: 'smartMoney' | 'arbitrage' | 'dipArb' | 'direct',
+  market: string,
+  tokenId: string,
+  side: 'YES' | 'NO' | 'UP' | 'DOWN',
+  size: number,
+  entryPrice: number
+): string {
+  if (!CONFIG.dryRun || !state.paper) return '';
+
+  const position: PaperPosition = {
+    id: `pp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: new Date().toISOString(),
+    strategy,
+    market,
+    tokenId,
+    side,
+    size,
+    entryPrice,
+    costBasis: size * entryPrice,
+    status: 'open',
+  };
+
+  state.paper.positions.push(position);
+  state.paper.totalVolume += position.costBasis;
+
+  log('TRADE', `[PAPER] OPEN ${strategy} | ${side} ${size.toFixed(1)} @ $${entryPrice.toFixed(3)} | ${market}`);
+
+  // Record in history
+  recordTradeForHistory({
+    strategy,
+    market: market.slice(0, 12),
+    side: side === 'YES' || side === 'UP' ? 'BUY' : 'SELL',
+    size,
+    price: entryPrice,
+    profit: 0, // Open position, no profit yet
+  });
+
+  updateDashboard();
+  return position.id;
+}
+
+function closePaperPosition(
+  positionId: string,
+  closePrice: number,
+  reason: 'manual' | 'resolution' | 'strategy' = 'manual'
+): number {
+  if (!CONFIG.dryRun || !state.paper) return 0;
+
+  const position = state.paper.positions.find(p => p.id === positionId && p.status === 'open');
+  if (!position) {
+    log('WARN', `[PAPER] Position ${positionId} not found or already closed`);
+    return 0;
+  }
+
+  const realizedPnL = (closePrice - position.entryPrice) * position.size;
+
+  position.status = 'closed';
+  position.closePrice = closePrice;
+  position.closeTimestamp = new Date().toISOString();
+  position.realizedPnL = realizedPnL;
+  position.closeReason = reason;
+
+  state.paper.pnl += realizedPnL;
+  state.paper.balance += realizedPnL;
+
+  log('TRADE', `[PAPER] CLOSE ${position.strategy} | ${position.side} ${position.size.toFixed(1)} @ $${closePrice.toFixed(3)} | PnL: $${realizedPnL.toFixed(2)}`);
+
+  // Record realized PnL
+  recordRealized(realizedPnL);
+
+  // Record in history
+  recordTradeForHistory({
+    strategy: position.strategy,
+    market: position.market.slice(0, 12),
+    side: position.side === 'YES' || position.side === 'UP' ? 'SELL' : 'BUY',
+    size: position.size,
+    price: closePrice,
+    profit: realizedPnL,
+  });
+
+  updateDashboard();
+  return realizedPnL;
+}
+
+function settlePaperPositionsOnResolution(market: string, winningOutcome: 'YES' | 'NO' | 'UP' | 'DOWN') {
+  if (!CONFIG.dryRun || !state.paper) return;
+
+  const openPositions = state.paper.positions.filter(
+    p => p.status === 'open' && p.market === market
+  );
+
+  if (openPositions.length === 0) return;
+
+  log('INFO', `[PAPER] Settling ${openPositions.length} position(s) on market resolution: ${market}`);
+
+  for (const position of openPositions) {
+    // Winner gets $1.00, loser gets $0.00
+    const closePrice = position.side === winningOutcome ? 1.00 : 0.00;
+    closePaperPosition(position.id, closePrice, 'resolution');
+  }
+}
+
+// ============================================================================
 // ============================================================================
 // STRATEGIES (simplified versions - copy full implementations from bot-config.ts)
 // ============================================================================
@@ -639,21 +748,33 @@ async function startSmartMoneyCopy(sdk: PolymarketSDK) {
       onTrade: (trade, result) => {
         if (result.success && trade.side === 'BUY') {
           recordEntry('smartMoney');
-          log('TRADE', `Copied BUY from ${trade.traderAddress.slice(0, 8)}... (${trade.size.toFixed(1)} sh @ ${trade.price})`);
+
+          // 🔴 FIX #12: Track paper positions for Smart Money in dry-run
           if (CONFIG.dryRun && state.paper) {
-            state.paper.trades++;
-            state.paper.totalVolume += trade.size * trade.price;
-            updateDashboard();
+            const market = trade.marketName || trade.tokenId.slice(0, 20);
+            const side = (trade.outcome === 'YES' || trade.outcome === 'NO') ? trade.outcome : 'YES';
+            openPaperPosition('smartMoney', market, trade.tokenId, side, trade.size, trade.price);
           }
+
+          log('TRADE', `Copied BUY from ${trade.traderAddress.slice(0, 8)}... (${trade.size.toFixed(1)} sh @ ${trade.price})`);
         }
       },
       onCopyPnl: (info) => {
         log('TRADE', `Copy closed ${info.closedSize.toFixed(2)} sh — PnL $${info.realizedUsd.toFixed(2)}`);
-        recordRealized(info.realizedUsd);
-        recordTradeForHistory({ strategy: 'smartMoney', market: info.tokenId.slice(0, 12), side: info.side, size: info.closedSize, price: 0, profit: info.realizedUsd });
+
+        // 🔴 FIX #12: Close paper positions on Smart Money exit
         if (CONFIG.dryRun && state.paper) {
-          state.paper.pnl += info.realizedUsd;
-          state.paper.balance += info.realizedUsd;
+          const openPositions = state.paper.positions.filter(
+            p => p.status === 'open' && p.strategy === 'smartMoney' && p.tokenId === info.tokenId
+          );
+
+          for (const pos of openPositions) {
+            const exitPrice = info.realizedUsd / info.closedSize + pos.entryPrice;
+            closePaperPosition(pos.id, exitPrice, 'strategy');
+          }
+        } else {
+          recordRealized(info.realizedUsd);
+          recordTradeForHistory({ strategy: 'smartMoney', market: info.tokenId.slice(0, 12), side: info.side, size: info.closedSize, price: 0, profit: info.realizedUsd });
         }
       },
       onError: (err) => log('ERROR', `Copy trading error: ${err.message}`),
@@ -874,12 +995,17 @@ async function setupArbitrage(_sdk: PolymarketSDK) {
     };
     log('ARB', `Opportunity: ${opp.type.toUpperCase()} +${opp.profitPercent.toFixed(2)}%`);
 
-    // SIMULATION HOOK
-    if (CONFIG.dryRun && opp.profitPercent > 0) {
-      // Conservative estimate: 10% of max size or min size
+    // 🔴 FIX #12: Open paper positions for both YES and NO in arbitrage
+    if (CONFIG.dryRun && opp.profitPercent > 0 && opp.market) {
       const size = Math.max(CONFIG.arbitrage.minTradeSize, 10);
-      const estimatedProfit = size * (opp.profitPercent / 100);
-      simulateTrade(estimatedProfit, 'arbitrage', `Arb ${opp.market}`);
+      const yesPrice = opp.yesPrice || 0.5;
+      const noPrice = opp.noPrice || 0.5;
+
+      // Open both sides of the arbitrage
+      openPaperPosition('arbitrage', opp.market.name, opp.market.id || 'unknown', 'YES', size, yesPrice);
+      openPaperPosition('arbitrage', opp.market.name, opp.market.id || 'unknown', 'NO', size, noPrice);
+
+      recordEntry('arbitrage');
     }
 
     updateDashboard();
@@ -1008,6 +1134,24 @@ async function setupDipArb(sdk: PolymarketSDK) {
       const shares = r.shares ? r.shares.toFixed(1) : '??';
       const market = state.activeDipArbMarket || 'unknown-market';
 
+      // 🔴 FIX #12: Track paper positions for DipArb in dry-run mode
+      if (CONFIG.dryRun && state.paper && r.price !== undefined && r.shares !== undefined) {
+        const side = (r.side === 'UP' || r.side === 'DOWN') ? r.side : 'UP';
+
+        switch (r.leg) {
+          case 'leg1':
+            // Open position on leg1
+            openPaperPosition('dipArb', market, market, side, r.shares, r.price);
+            recordEntry('dipArb');
+            break;
+          case 'leg2':
+            // Open hedge position on leg2
+            const hedgeSide = side === 'UP' ? 'DOWN' : 'UP';
+            openPaperPosition('dipArb', market, market, hedgeSide, r.shares, r.price);
+            break;
+        }
+      }
+
       switch (r.leg) {
         case 'leg1':
           log('TRADE', `OPEN ${r.side} | ${shares} shares @ $${price} | ${market}`);
@@ -1025,7 +1169,7 @@ async function setupDipArb(sdk: PolymarketSDK) {
           log('TRADE', `DipArb ${r.leg}: ${r.side} @ ${price}`);
       }
       // v3.2: one entry per ROUND (leg1 opens it) — legs are not trades
-      if (r.leg === 'leg1') recordEntry('dipArb');
+      if (r.leg === 'leg1' && !CONFIG.dryRun) recordEntry('dipArb');
     } else {
       log('WARN', `DipArb Execution Failed (${r.leg}): ${r.error || 'Unknown error'}`);
     }
@@ -1037,8 +1181,23 @@ async function setupDipArb(sdk: PolymarketSDK) {
     if (r.status === 'completed') {
       const shares = r.leg2?.shares ?? 0;
       const netProfit = (r.profit ?? 0) * shares;
-      recordRealized(netProfit);
-      recordTradeForHistory({ strategy: 'dipArb', market: state.activeDipArbMarket ?? 'unknown', side: 'BUY', size: shares, price: 0, profit: netProfit });
+
+      // 🔴 FIX #12: Close paper positions on round complete in dry-run
+      if (CONFIG.dryRun && state.paper) {
+        const market = state.activeDipArbMarket ?? 'unknown';
+        const openPositions = state.paper.positions.filter(
+          p => p.status === 'open' && p.strategy === 'dipArb' && p.market === market
+        );
+
+        // Close all positions for this round at $1.00 (merged)
+        for (const pos of openPositions) {
+          closePaperPosition(pos.id, 1.00, 'strategy');
+        }
+      } else {
+        recordRealized(netProfit);
+        recordTradeForHistory({ strategy: 'dipArb', market: state.activeDipArbMarket ?? 'unknown', side: 'BUY', size: shares, price: 0, profit: netProfit });
+      }
+
       log('TRADE', `DipArb round ${r.roundId.slice(0, 12)} completed: ${shares.toFixed(1)} sh, net +$${netProfit.toFixed(2)}`);
     } else {
       // expired / partial: book only when Leg1 was actually exited for a price
@@ -1046,7 +1205,21 @@ async function setupDipArb(sdk: PolymarketSDK) {
       const exit = r.exitResult;
       if (leg1 && exit?.success && (exit.shares ?? 0) > 0 && exit.price !== undefined) {
         const netProfit = (exit.price - leg1.price) * (exit.shares ?? 0);
-        recordRealized(netProfit);
+
+        // 🔴 FIX #12: Close paper positions on timeout exit
+        if (CONFIG.dryRun && state.paper) {
+          const market = state.activeDipArbMarket ?? 'unknown';
+          const openPositions = state.paper.positions.filter(
+            p => p.status === 'open' && p.strategy === 'dipArb' && p.market === market
+          );
+
+          for (const pos of openPositions) {
+            closePaperPosition(pos.id, exit.price, 'strategy');
+          }
+        } else {
+          recordRealized(netProfit);
+        }
+
         log('TRADE', `DipArb round ${r.roundId.slice(0, 12)} ${r.status}: exited Leg1 ${exit.shares!.toFixed(1)} @ $${exit.price.toFixed(3)} → $${netProfit.toFixed(2)}`);
       } else {
         log('WARN', `DipArb round ${r.roundId.slice(0, 12)} ${r.status}: no booked exit${exit ? ` (${exit.error ?? 'exit failed'})` : ''} — PnL untracked, exposure sync will reflect it`);
@@ -1501,6 +1674,7 @@ async function main() {
       pnl: 0,
       trades: 0,
       totalVolume: 0,
+      positions: [],  // 🔴 FIX #12: Track paper positions
     };
     log('INFO', '📝 Paper Trading Activated: Simulating trades with $250 initial capital');
     updateDashboard();
@@ -1558,6 +1732,7 @@ async function main() {
             pnl: 0,
             trades: 0,
             totalVolume: 0,
+            positions: [],  // 🔴 FIX #12: Track paper positions
           };
         }
 
